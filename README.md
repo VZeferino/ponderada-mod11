@@ -8,4 +8,4 @@ O ESP32-CAM captura a imagem, realiza o processamento para identificar a pessoa,
 ESP32-CAM: Placa de desenvolvimento com câmera integrada para captura de imagens.
 DumbDisplay App: Aplicativo Android usado para exibir as informações de identificação de maneira simples no celular.
 
-Um vídeo demonstrando a solução está dentro da pasta esp32.
+Um vídeo demonstrando a solução está dentro da pasta esp32, ou [aqui](https://youtube.com/shorts/EC70LdVwIC0?feature=share).
