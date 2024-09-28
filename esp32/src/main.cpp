@@ -11,6 +11,9 @@
 
 #include "esp_camera.h" 
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <TensorFlowLite_ESP32.h>
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 #include "tensorflow/lite/micro/micro_error_reporter.h"
@@ -26,6 +29,10 @@
 // *****
 #include "person_detect_model_data.h"
 
+SemaphoreHandle_t xSemaphoreImageReady;
+SemaphoreHandle_t xMutexImage;
+
+camera_fb_t *fb = NULL;
 
 class DDTFLErrorReporter : public tflite::ErrorReporter {
 public:
@@ -66,9 +73,28 @@ camera_fb_t* captureImage(bool useFlash);
 void releaseCapturedImage(camera_fb_t* fb);
 bool cameraReady;
 
+// Threads
+void ImageAcquisitionTask(void *pvParameters);
+void ImageSendingTask(void *pvParameters);
+void DetectionReceivingTask(void *pvParameters);
 
 void setup() {
   Serial.begin(115200);
+
+  // Inicializa o semáforo binário e o mutex
+  xSemaphoreImageReady = xSemaphoreCreateBinary();
+  xMutexImage = xSemaphoreCreateMutex();
+
+  // Verifica se os semáforos e o mutex foram criados corretamente
+  if (xSemaphoreImageReady == NULL || xMutexImage == NULL) {
+    Serial.println("Erro ao criar semáforos ou mutex!");
+    while (true);  // Para o código se falhar
+  }
+
+  // Criação dos threads
+  xTaskCreatePinnedToCore(ImageAcquisitionTask, "ImageAcquisitionTask", 8192, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(ImageSendingTask, "ImageSendingTask", 8192, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(DetectionReceivingTask, "DetectionReceivingTask", 4096, NULL, 1, NULL, 1);
 
   // create and setup [top] graphical layer for showing candidate image for person detection;
   // clicking it will invoke person detection
@@ -142,90 +168,129 @@ void setup() {
 
 
 void loop() {
-  if (!cameraReady || interpreter == NULL) {
-    error_reporter->Report("Not Initialized!");
-    delay(2000);
-    return;
-  }
-
-  // capture candidate image for person detection
-  camera_fb_t* capturedImage = captureImage(false);
-  if (capturedImage == NULL) {
-    error_reporter->Report("Error: Camera capture failed");
-    delay(2000);
-    return;
-  }
-
-  detectImageLayer->cachePixelImageGS(imageName, capturedImage->buf, imageWidth, imageHeight);  // cache image for drawing
-  detectImageLayer->drawImageFileFit(imageName);
-
-  // check if detectImageLayer (top; candidate image) clicked
-  // if clicked, invoke person detection
-  if (detectImageLayer->getFeedback() != NULL) {
-    statusLayer->clear();
-    statusLayer->pixelColor("red");
-    statusLayer->writeCenteredLine(".. detecting ..", 1);
-
-    dumbdisplay.writeComment("start ... ");
-
-    // copy an image with a person into the memory area used for the input
-    const uint8_t* person_data = capturedImage->buf;
-    for (int i = 0; i < input->bytes; ++i) {
-      input->data.int8[i] = person_data[i] ^ 0x80;  // signed int8_t quantized ==> input images must be converted from unisgned to signed format
-    }
-
-    // run the model on this input and make sure it succeeds
-    long detect_start_millis = millis();
-    TfLiteStatus invoke_status = interpreter->Invoke();
-    if (invoke_status != kTfLiteOk) {
-      error_reporter->Report("Invoke failed");
-    }
-    long detect_taken_millis = millis() - detect_start_millis;
-
-    // process the inference (person detection) results
-    TfLiteTensor* output = interpreter->output(0);
-    int8_t _person_score = output->data.int8[kPersonIndex];
-    int8_t _no_person_score = output->data.int8[kNotAPersonIndex];
-    float person_score = (_person_score - output->params.zero_point) * output->params.scale;  // person_score should be chance from 0 to 1
-    float no_person_score = (_no_person_score - output->params.zero_point) * output->params.scale;
-    bool detected_person = person_score > PersonScoreThreshold;
-
-    dumbdisplay.writeComment(String("... person score: ") + String(person_score) + " ...");
-    dumbdisplay.writeComment(String("... NO person score: ") + String(no_person_score) + " ...");
-    dumbdisplay.writeComment("... done");
-
-    personImageLayer->unloadImageFile(imageName);  // remove any previous caching
-    if (detected_person) {
-      // save image to phone
-      dumbdisplay.savePixelImageGS(imageName, capturedImage->buf, imageWidth, imageHeight);
-      dumbdisplay.writeComment("detected ... save image to phone");
-    } else {
-      // only cache image for drawing
-      personImageLayer->cachePixelImageGS(imageName, capturedImage->buf, imageWidth, imageHeight);
-    }
-    personImageLayer->drawImageFileFit(imageName);
-
-    statusLayer->clear();
-    if (detected_person) {
-      personImageLayer->backgroundColor("green");
-      statusLayer->pixelColor("darkgreen");
-      statusLayer->writeCenteredLine("Detected!", 0);
-    } else {
-      personImageLayer->backgroundColor("gray");
-      statusLayer->pixelColor("darkgray");
-      statusLayer->writeCenteredLine("NO person!", 0);
-    }
-    statusLayer->writeLine(String("  SCORE : ") + String((int8_t) (100 * person_score)) + "%", 2);
-    statusLayer->writeLine(String("  IN    : ") + String((float) detect_taken_millis / 1000.0) + "s", 3);
-
-    delay(1000);
-  }
-
-  releaseCapturedImage(capturedImage);
+  // O FreeRTOS gerencia as tasks
 }
 
+// Thread 1: Aquisição de Imagem
+void ImageAcquisitionTask(void *pvParameters) {
+  for (;;) {
+    if (!cameraReady || interpreter == NULL) {
+      error_reporter->Report("Not Initialized!");
+      vTaskDelay(2000 / portTICK_PERIOD_MS);
+      continue;
+    }
 
+    // Captura uma imagem da câmera
+    camera_fb_t* capturedImage = captureImage(false);
 
+    if (capturedImage != NULL) {
+      xSemaphoreTake(xMutexImage, portMAX_DELAY);  // Bloqueia o mutex para acessar a imagem
+      fb = capturedImage;  // Armazena a imagem capturada
+      xSemaphoreGive(xMutexImage);  // Libera o mutex
+      xSemaphoreGive(xSemaphoreImageReady);  // Sinaliza que há uma nova imagem disponível
+    } else {
+      error_reporter->Report("Error: Camera capture failed");
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+
+    vTaskDelay(500 / portTICK_PERIOD_MS);  // Aguarda um tempo antes da próxima captura
+  }
+}
+
+// Thread 2: Processamento e Envio de Imagens
+void ImageSendingTask(void *pvParameters) {
+  for (;;) {
+    if (xSemaphoreTake(xSemaphoreImageReady, portMAX_DELAY)) {  // Aguarda o semáforo de nova imagem
+      xSemaphoreTake(xMutexImage, portMAX_DELAY);  // Bloqueia o mutex para acessar a imagem
+
+      if (fb != NULL) {
+        // Exibe imagem capturada no DumbDisplay
+        detectImageLayer->cachePixelImageGS(imageName, fb->buf, imageWidth, imageHeight);
+        detectImageLayer->drawImageFileFit(imageName);
+
+        // Verifica se o detectImageLayer foi clicado para processar detecção
+        if (detectImageLayer->getFeedback() != NULL) {
+          statusLayer->clear();
+          statusLayer->pixelColor("red");
+          statusLayer->writeCenteredLine(".. detecting ..", 1);
+
+          dumbdisplay.writeComment("start ... ");
+
+          // Copia a imagem para a entrada do modelo TensorFlow
+          const uint8_t* person_data = fb->buf;
+          for (int i = 0; i < input->bytes; ++i) {
+            input->data.int8[i] = person_data[i] ^ 0x80;  // Converte imagem de unsigned para signed
+          }
+
+          // Roda o modelo TensorFlow para detecção
+          long detect_start_millis = millis();
+          TfLiteStatus invoke_status = interpreter->Invoke();
+          if (invoke_status != kTfLiteOk) {
+            error_reporter->Report("Invoke failed");
+          }
+          long detect_taken_millis = millis() - detect_start_millis;
+
+          // Processa os resultados da inferência
+          TfLiteTensor* output = interpreter->output(0);
+          int8_t _person_score = output->data.int8[kPersonIndex];
+          int8_t _no_person_score = output->data.int8[kNotAPersonIndex];
+          float person_score = (_person_score - output->params.zero_point) * output->params.scale;
+          float no_person_score = (_no_person_score - output->params.zero_point) * output->params.scale;
+          bool detected_person = person_score > PersonScoreThreshold;
+
+          dumbdisplay.writeComment(String("... person score: ") + String(person_score) + " ...");
+          dumbdisplay.writeComment(String("... NO person score: ") + String(no_person_score) + " ...");
+          dumbdisplay.writeComment("... done");
+
+          // Atualiza o DumbDisplay com os resultados da detecção
+          personImageLayer->unloadImageFile(imageName);  // Remove qualquer cache anterior
+          if (detected_person) {
+            // Salva a imagem detectada no telefone via DumbDisplay
+            dumbdisplay.savePixelImageGS(imageName, fb->buf, imageWidth, imageHeight);
+            dumbdisplay.writeComment("detected ... save image to phone");
+          } else {
+            // Apenas cacheia a imagem para exibição
+            personImageLayer->cachePixelImageGS(imageName, fb->buf, imageWidth, imageHeight);
+          }
+          personImageLayer->drawImageFileFit(imageName);
+
+          // Atualiza a camada de status
+          statusLayer->clear();
+          if (detected_person) {
+            personImageLayer->backgroundColor("green");
+            statusLayer->pixelColor("darkgreen");
+            statusLayer->writeCenteredLine("Detected!", 0);
+          } else {
+            personImageLayer->backgroundColor("gray");
+            statusLayer->pixelColor("darkgray");
+            statusLayer->writeCenteredLine("NO person!", 0);
+          }
+          statusLayer->writeLine(String("  SCORE : ") + String((int8_t) (100 * person_score)) + "%", 2);
+          statusLayer->writeLine(String("  IN    : ") + String((float) detect_taken_millis / 1000.0) + "s", 3);
+
+          vTaskDelay(1000 / portTICK_PERIOD_MS);
+        }
+
+        releaseCapturedImage(fb);  // Libera a imagem da memória
+        fb = NULL;
+      }
+      xSemaphoreGive(xMutexImage);  // Libera o mutex
+    }
+  }
+}
+
+// Thread 3: Recebimento de Detecção
+void DetectionReceivingTask(void *pvParameters) {
+  for (;;) {
+    // Monitora a entrada serial para receber detecções
+    // Mas lembrando que nessa solução quen realiza as informações seria o dumbdisplay
+    if (Serial.available()) {
+      String detectionData = Serial.readStringUntil('\n');
+      Serial.println("Received detection data: " + detectionData);
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS); 
+  }
+}
 
 int cameraImageBrightness = 0;                       // Image brightness (-2 to +2)
 
